@@ -1,0 +1,495 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+
+contract LibraryDRM is AccessControl, ReentrancyGuard {
+    using Counters for Counters.Counter;
+
+    bytes32 public constant PUBLISHER_ROLE = keccak256("PUBLISHER_ROLE");
+bytes32 public constant TRUSTED_NODE_ROLE = keccak256("TRUSTED_NODE_ROLE");
+
+    Counters.Counter private _bookIdCounter;
+    Counters.Counter private _memberIdCounter;
+    Counters.Counter private _publisherIdCounter;
+
+    // prime field (secp256k1 prime)
+    uint256 constant FIELD_PRIME = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
+
+    constructor(address admin) {
+    address a = admin == address(0) ? msg.sender : admin;
+    _grantRole(DEFAULT_ADMIN_ROLE, a);  // <-- Fix: Use _grantRole instead of _setupRole
+    // Admin can later grant publisher/trusted-node roles explicitly
+}
+
+    // -------------------------
+    // Data models
+    // -------------------------
+    enum ContentType { Physical, EBook }
+    enum BorrowStatus { None, Borrowed, Reserved, Suspended }
+
+    struct Member {
+        uint256 id;
+        address wallet;
+        bool active;
+        uint256 activeBorrows;
+    }
+
+    struct Publisher {
+        uint256 id;
+        address wallet;
+        string name;
+    }
+
+    struct Book {
+        uint256 id;
+        string title;
+        string ipfsURI; // encrypted content location
+        ContentType ctype;
+        address publisher;
+        uint256 copies;
+        BorrowStatus status;
+        address currentHolder;
+        uint256 borrowDue;
+        bool exists;
+    }
+
+    struct DRMShare {
+        uint256 x;
+        uint256 y;
+        address submitter;
+    }
+
+    struct DRMRecord {
+        bool exists;
+        uint8 threshold;
+        uint8 totalShares;
+        mapping(uint256 => DRMShare) shares; // x -> share
+        uint256 sharesCount;
+        bool reconstructed;
+        uint256 reconstructedSecret;
+        uint256[] submittedXs; // track which x's were submitted (deterministic iteration)
+    }
+
+    // -------------------------
+    // Storage
+    // -------------------------
+    mapping(address => uint256) public memberOf; // wallet -> memberId
+    mapping(uint256 => Member) public members;   // id -> Member
+    mapping(uint256 => Publisher) public publishers;
+    mapping(address => uint256) public publisherOf; // wallet -> publisherId
+
+    mapping(uint256 => Book) public books; // bookId -> Book
+    mapping(uint256 => DRMRecord) private drmRecords; // bookId -> DRMRecord
+
+    uint256[] private publisherList;
+    uint256[] private memberList;
+    uint256[] private activeMemberList;
+    uint256[] private bookList;
+
+    // -------------------------
+    // Events
+    // -------------------------
+    event MemberAdded(uint256 memberId, address wallet);
+    event PublisherAdded(uint256 publisherId, address wallet, string name);
+    event BookAdded(uint256 bookId, string title, ContentType ctype, address publisher);
+    event Borrowed(uint256 bookId, address borrower, uint256 due);
+    event Returned(uint256 bookId, address borrower);
+    event Extended(uint256 bookId, address borrower, uint256 newDue);
+    event Reserved(uint256 bookId, address reserver);
+    event Suspended(uint256 bookId, address by);
+    event ShareSubmitted(uint256 bookId, uint256 x, uint256 y, address submitter);
+    event SecretReconstructed(uint256 bookId);
+
+    // -------------------------
+    // Modifiers
+    // -------------------------
+    modifier onlyMember() {
+        require(memberOf[msg.sender] != 0, "Not a member");
+        _;
+    }
+
+    modifier bookExists(uint256 bookId) {
+        require(books[bookId].exists, "Book doesn't exist");
+        _;
+    }
+
+    // -------------------------
+    // Member & Publisher Management
+    // -------------------------
+    function addMember(address wallet) external onlyRole(DEFAULT_ADMIN_ROLE) returns (uint256) {
+        require(wallet != address(0), "invalid wallet");
+        require(memberOf[wallet] == 0, "already member");
+
+        _memberIdCounter.increment();
+        uint256 id = _memberIdCounter.current();
+        members[id] = Member({ id: id, wallet: wallet, active: true, activeBorrows: 0 });
+        memberOf[wallet] = id;
+        memberList.push(id);
+        activeMemberList.push(id);
+
+        emit MemberAdded(id, wallet);
+        return id;
+    }
+
+    function addPublisher(address wallet, string calldata name) external onlyRole(DEFAULT_ADMIN_ROLE) returns (uint256) {
+        require(wallet != address(0), "invalid wallet");
+        require(publisherOf[wallet] == 0, "already publisher");
+
+        _publisherIdCounter.increment();
+        uint256 id = _publisherIdCounter.current();
+        publishers[id] = Publisher({ id: id, wallet: wallet, name: name });
+        publisherOf[wallet] = id;
+        publisherList.push(id);
+
+        // Grant publisher role
+        _grantRole(PUBLISHER_ROLE, wallet);
+
+        emit PublisherAdded(id, wallet, name);
+        return id;
+    }
+
+    function getTotalMembers() external view returns (uint256) {
+        return _memberIdCounter.current();
+    }
+
+    function getTotalPublishers() external view returns (uint256) {
+        return _publisherIdCounter.current();
+    }
+
+    function getActiveMembers() external view returns (uint256[] memory) {
+        return activeMemberList;
+    }
+
+    function getPublisherList() external view returns (uint256[] memory) {
+        return publisherList;
+    }
+
+    // -------------------------
+    // Book Management
+    // -------------------------
+    function addBookPhysical(
+        string calldata title,
+        uint256 copies,
+        address publisherAddr
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) returns (uint256) {
+        require(publisherOf[publisherAddr] != 0, "invalid publisher");
+
+        _bookIdCounter.increment();
+        uint256 id = _bookIdCounter.current();
+
+        books[id] = Book({
+            id: id,
+            title: title,
+            ipfsURI: "",
+            ctype: ContentType.Physical,
+            publisher: publisherAddr,
+            copies: copies,
+            status: BorrowStatus.None,
+            currentHolder: address(0),
+            borrowDue: 0,
+            exists: true
+        });
+
+        bookList.push(id);
+        emit BookAdded(id, title, ContentType.Physical, publisherAddr);
+        return id;
+    }
+
+    function addEBook(
+        string calldata title,
+        string calldata ipfsURI,
+        address publisherAddr,
+        uint8 threshold,
+        uint8 totalShares
+    ) external onlyRole(PUBLISHER_ROLE) returns (uint256) {
+        require(publisherOf[publisherAddr] != 0, "invalid publisher");
+        require(threshold > 0 && totalShares >= threshold, "invalid SSS params");
+
+        _bookIdCounter.increment();
+        uint256 id = _bookIdCounter.current();
+
+        books[id] = Book({
+            id: id,
+            title: title,
+            ipfsURI: ipfsURI,
+            ctype: ContentType.EBook,
+            publisher: publisherAddr,
+            copies: 1,
+            status: BorrowStatus.None,
+            currentHolder: address(0),
+            borrowDue: 0,
+            exists: true
+        });
+
+        DRMRecord storage rec = drmRecords[id];
+        rec.exists = true;
+        rec.threshold = threshold;
+        rec.totalShares = totalShares;
+        rec.sharesCount = 0;
+        rec.reconstructed = false;
+
+        bookList.push(id);
+        emit BookAdded(id, title, ContentType.EBook, publisherAddr);
+        return id;
+    }
+
+    function totalBooks() external view returns (uint256) {
+        return _bookIdCounter.current();
+    }
+
+    function listBookIds() external view returns (uint256[] memory) {
+        return bookList;
+    }
+
+    // -------------------------
+    // Borrowing / Returning / Other flows
+    // -------------------------
+    uint256 constant BORROW_PERIOD = 7 days;
+
+    function borrowBook(uint256 bookId) external nonReentrant onlyMember bookExists(bookId) {
+        Book storage b = books[bookId];
+        Member storage m = members[memberOf[msg.sender]];
+        require(m.active, "member not active");
+
+        require(b.ctype == ContentType.Physical ? b.copies > 0 : b.status != BorrowStatus.Borrowed, "not available");
+
+        if (b.ctype == ContentType.Physical) {
+            b.copies -= 1;
+        }
+        b.status = BorrowStatus.Borrowed;
+        b.currentHolder = msg.sender;
+        b.borrowDue = block.timestamp + BORROW_PERIOD;
+        m.activeBorrows += 1;
+
+        emit Borrowed(bookId, msg.sender, b.borrowDue);
+    }
+
+    function returnBook(uint256 bookId) external nonReentrant onlyMember bookExists(bookId) {
+        Book storage b = books[bookId];
+        Member storage m = members[memberOf[msg.sender]];
+        require(b.currentHolder == msg.sender, "not holder");
+
+        if (b.ctype == ContentType.Physical) {
+            b.copies += 1;
+        }
+        b.status = BorrowStatus.None;
+        b.currentHolder = address(0);
+        b.borrowDue = 0;
+        if (m.activeBorrows > 0) { m.activeBorrows -= 1; }
+
+        emit Returned(bookId, msg.sender);
+    }
+
+    function extendBorrow(uint256 bookId, uint256 extraSeconds) external nonReentrant onlyMember bookExists(bookId) {
+        Book storage b = books[bookId];
+        require(b.currentHolder == msg.sender, "not holder");
+        b.borrowDue += extraSeconds;
+        emit Extended(bookId, msg.sender, b.borrowDue);
+    }
+
+    function reserveBook(uint256 bookId) external nonReentrant onlyMember bookExists(bookId) {
+        Book storage b = books[bookId];
+        require(b.status == BorrowStatus.None, "cannot reserve");
+        b.status = BorrowStatus.Reserved;
+        b.currentHolder = msg.sender;
+        emit Reserved(bookId, msg.sender);
+    }
+
+    function suspendBook(uint256 bookId) external onlyRole(DEFAULT_ADMIN_ROLE) bookExists(bookId) {
+        Book storage b = books[bookId];
+        b.status = BorrowStatus.Suspended;
+        emit Suspended(bookId, msg.sender);
+    }
+
+    // -------------------------
+    // DRM: Share submission & Reconstruction
+    // -------------------------
+    function submitShare(uint256 bookId, uint256 x, uint256 y) external onlyRole(TRUSTED_NODE_ROLE) bookExists(bookId) {
+        DRMRecord storage rec = drmRecords[bookId];
+        require(rec.exists, "no drm record");
+        require(!rec.reconstructed, "already reconstructed");
+        require(rec.sharesCount < rec.totalShares, "all shares already submitted");
+        require(rec.shares[x].submitter == address(0), "share for x exists");
+
+        rec.shares[x] = DRMShare({ x: x, y: y, submitter: msg.sender });
+        rec.sharesCount += 1;
+        rec.submittedXs.push(x);
+
+        emit ShareSubmitted(bookId, x, y, msg.sender);
+    }
+
+    // reconstructCEK restricted to admin in this demo
+    function reconstructCEK(uint256 bookId) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) bookExists(bookId) returns (uint256) {
+        DRMRecord storage rec = drmRecords[bookId];
+        require(rec.exists, "no drm record");
+        require(!rec.reconstructed, "already reconstructed");
+        require(rec.sharesCount >= rec.threshold, "not enough shares");
+
+        uint8 t = rec.threshold;
+        uint256[] memory xs = new uint256[](t);
+        uint256[] memory ys = new uint256[](t);
+
+        // pick first t submitted x's
+        for (uint8 i = 0; i < t; ++i) {
+            xs[i] = rec.submittedXs[i];
+            ys[i] = rec.shares[xs[i]].y;
+        }
+
+        uint256 secret = lagrangeInterpolateAtZero(xs, ys, t);
+        rec.reconstructed = true;
+        rec.reconstructedSecret = secret;
+
+        emit SecretReconstructed(bookId);
+        return secret;
+    }
+
+    // Lagrange interpolation at x=0 in FIELD_PRIME
+    function lagrangeInterpolateAtZero(uint256[] memory xs, uint256[] memory ys, uint8 t) internal pure returns (uint256) {
+        uint256 p = FIELD_PRIME;
+        uint256 secret = 0;
+
+        for (uint8 i = 0; i < t; ++i) {
+            uint256 xi = xs[i] % p;
+            uint256 yi = ys[i] % p;
+            uint256 li = 1;
+
+            for (uint8 j = 0; j < t; ++j) {
+                if (j == i) continue;
+                uint256 xj = xs[j] % p;
+                uint256 num = xj;
+                uint256 den = (xj + p - xi) % p;
+                uint256 invDen = modInverse(den, p);
+                li = mulmod(li, mulmod(num, invDen, p), p);
+            }
+
+            uint256 term = mulmod(yi, li, p);
+            secret = addmod(secret, term, p);
+        }
+
+        return secret;
+    }
+
+    // modular inverse using Fermat's little theorem (p must be prime)
+    function modInverse(uint256 a, uint256 p) internal pure returns (uint256) {
+        require(a != 0 && a < p, "invalid a");
+        return modExp(a, p - 2, p);
+    }
+
+    // fast modular exponentiation (base^exp % mod)
+    function modExp(uint256 base, uint256 exp, uint256 mod) internal pure returns (uint256) {
+        uint256 result = 1;
+        uint256 b = base % mod;
+        uint256 e = exp;
+        while (e > 0) {
+            if ((e & 1) == 1) {
+                result = mulmod(result, b, mod);
+            }
+            b = mulmod(b, b, mod);
+            e >>= 1;
+        }
+        return result;
+    }
+
+    // -------------------------
+    // Demo: insecure on-chain splitting (FOR TESTING ONLY)
+    // -------------------------
+    function insecureOnChainSplitAndStore(
+        uint256 bookId,
+        uint256 secret,
+        uint8 threshold,
+        uint8 totalShares
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) bookExists(bookId) {
+        DRMRecord storage rec = drmRecords[bookId];
+        require(rec.exists, "no drm record");
+        require(!rec.reconstructed, "already reconstructed");
+        require(threshold == rec.threshold && totalShares == rec.totalShares, "params mismatch drmRecord");
+
+        // derive pseudo-random coefficients (INSECURE)
+        uint256[] memory coeffs = new uint256[](threshold);
+        coeffs[0] = secret;
+        for (uint8 i = 1; i < threshold; ++i) {
+            bytes32 h = keccak256(abi.encodePacked(blockhash(block.number - 1), bookId, i, block.timestamp));
+            coeffs[i] = uint256(h) % FIELD_PRIME;
+        }
+
+        for (uint256 x = 1; x <= totalShares; ++x) {
+            uint256 fx = 0;
+            uint256 xp = 1;
+            for (uint8 c = 0; c < threshold; ++c) {
+                uint256 term = mulmod(coeffs[c], xp, FIELD_PRIME);
+                fx = addmod(fx, term, FIELD_PRIME);
+                xp = mulmod(xp, x, FIELD_PRIME);
+            }
+
+            if (rec.shares[x].submitter == address(0)) {
+                rec.shares[x] = DRMShare({ x: x, y: fx, submitter: msg.sender });
+                rec.sharesCount += 1;
+                rec.submittedXs.push(x);
+            }
+            emit ShareSubmitted(bookId, x, fx, msg.sender);
+        }
+    }
+
+    // -------------------------
+    // Read helpers
+    // -------------------------
+    function drmInfo(uint256 bookId) external view returns (bool existsRec, uint8 threshold, uint8 totalShares, uint256 sharesCount, bool reconstructed) {
+        DRMRecord storage rec = drmRecords[bookId];
+        existsRec = rec.exists;
+        threshold = rec.threshold;
+        totalShares = rec.totalShares;
+        sharesCount = rec.sharesCount;
+        reconstructed = rec.reconstructed;
+    }
+
+    function readShare(uint256 bookId, uint256 x) external view returns (uint256 rx, uint256 ry, address submitter) {
+        DRMRecord storage rec = drmRecords[bookId];
+        require(rec.exists, "no drm record");
+        DRMShare storage s = rec.shares[x];
+        require(s.submitter != address(0), "no share at x");
+        return (s.x, s.y, s.submitter);
+    }
+
+    function getSubmittedXs(uint256 bookId) external view returns (uint256[] memory) {
+        DRMRecord storage rec = drmRecords[bookId];
+        require(rec.exists, "no drm record");
+        return rec.submittedXs;
+    }
+
+    function getReconstructedSecret(uint256 bookId) external view onlyRole(DEFAULT_ADMIN_ROLE) returns (uint256) {
+        DRMRecord storage rec = drmRecords[bookId];
+        require(rec.exists, "no drm record");
+        require(rec.reconstructed, "not reconstructed");
+        return rec.reconstructedSecret;
+    }
+
+    // -------------------------
+    // Admin helpers
+    // -------------------------
+    function grantTrustedNode(address node) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(TRUSTED_NODE_ROLE, node);
+    }
+
+    function revokeTrustedNode(address node) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _revokeRole(TRUSTED_NODE_ROLE, node);
+    }
+
+    function grantPublisher(address publisher) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(PUBLISHER_ROLE, publisher);
+    }
+
+    function revokePublisher(address publisher) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _revokeRole(PUBLISHER_ROLE, publisher);
+    }
+
+    function isPublisher(address addr) external view returns (bool) {
+        return hasRole(PUBLISHER_ROLE, addr);
+    }
+
+    function isTrustedNode(address addr) external view returns (bool) {
+        return hasRole(TRUSTED_NODE_ROLE, addr);
+    }
+}
